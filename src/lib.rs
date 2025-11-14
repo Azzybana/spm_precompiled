@@ -6,6 +6,8 @@
 //! This crate is highly specialized and not intended for general use.
 //!
 //! The core of the algorithm is to read spm's binary `precompiled_charsmap`.
+use base64::{engine::general_purpose, Engine as _};
+use memchr::memchr;
 use nom::{number::complete::le_u32, IResult, ToUsize};
 use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 use std::convert::TryFrom;
@@ -46,7 +48,7 @@ where
     T: AsRef<[u8]>,
     S: Serializer,
 {
-    serializer.serialize_str(&base64::encode(key.as_ref()))
+    serializer.serialize_str(&general_purpose::STANDARD.encode(key.as_ref()))
 }
 
 fn from_base64<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
@@ -54,7 +56,10 @@ where
     D: Deserializer<'de>,
 {
     let s: &str = Deserialize::deserialize(deserializer)?;
-    let precompiled_charsmap = base64::decode(s).map_err(|err| Error::custom(err.to_string()))?;
+    let precompiled_charsmap =
+        general_purpose::STANDARD
+            .decode(s)
+            .map_err(|err| Error::custom(err.to_string()))?;
     Ok(precompiled_charsmap)
 }
 
@@ -76,18 +81,22 @@ trait ArrayUnitTrait {
 }
 
 impl ArrayUnitTrait for ArrayUnit {
+    #[inline(always)]
     fn has_leaf(&self) -> bool {
         (self >> 8) & 1 == 1
     }
 
+    #[inline(always)]
     fn value(&self) -> isize {
         (self & ((1usize << 31) - 1)) as isize
     }
 
+    #[inline(always)]
     fn label(&self) -> usize {
         self & ((1usize << 31) | 0xFF)
     }
 
+    #[inline(always)]
     fn offset(&self) -> usize {
         (self >> 10) << ((self & (1usize << 9)) >> 6)
     }
@@ -105,30 +114,57 @@ impl DoubleArray {
         Self { array }
     }
 
+    /// Returns every value registered in the trie that occurs as a prefix of `key`.
+    #[inline]
     pub fn common_prefix_search(&self, key: &[u8]) -> Vec<isize> {
         let mut node_pos = 0;
-        let mut results = vec![];
+        let mut results: Option<Vec<isize>> = None;
 
         let mut unit = self.array[node_pos];
         node_pos ^= unit.offset();
-        for c in key {
-            if *c == 0u8 {
+        for &c in key {
+            if c == 0u8 {
                 break;
             }
-            node_pos ^= *c as usize;
+            node_pos ^= c as usize;
             unit = self.array[node_pos];
-            if unit.label() != *c as usize {
-                return results;
+            if unit.label() != c as usize {
+                return results.unwrap_or_default();
             }
             node_pos ^= unit.offset();
             if unit.has_leaf() {
-                results.push(self.array[node_pos].value());
+                results
+                    .get_or_insert_with(|| Vec::with_capacity(4))
+                    .push(self.array[node_pos].value());
             }
         }
-        results
+        results.unwrap_or_default()
+    }
+
+    #[inline]
+    fn first_prefix_value(&self, key: &[u8]) -> Option<isize> {
+        let mut node_pos = 0;
+        let mut unit = self.array[node_pos];
+        node_pos ^= unit.offset();
+        for &c in key {
+            if c == 0u8 {
+                break;
+            }
+            node_pos ^= c as usize;
+            unit = self.array[node_pos];
+            if unit.label() != c as usize {
+                return None;
+            }
+            node_pos ^= unit.offset();
+            if unit.has_leaf() {
+                return Some(self.array[node_pos].value());
+            }
+        }
+        None
     }
 }
 
+/// Splits a `precompiled_charsmap` blob into the serialized trie and normalized string.
 fn parse(precompiled_charsmap: &[u8]) -> IResult<&[u8], Array> {
     let (mut rest, trie_size) = le_u32(precompiled_charsmap)?;
     // u8 to u32.
@@ -158,38 +194,31 @@ impl std::fmt::Display for PrecompiledError {
 impl std::error::Error for PrecompiledError {}
 
 impl Precompiled {
+    /// Builds a `Precompiled` instance from a raw SentencePiece `precompiled_charsmap` blob.
     pub fn from(precompiled_charsmap: &[u8]) -> Result<Precompiled, PrecompiledError> {
         let (normalized_blob, trie_blob) =
             parse(precompiled_charsmap).map_err(|_| PrecompiledError::ParseError)?;
         let normalized = String::from_utf8(normalized_blob.to_vec())
             .map_err(|_| PrecompiledError::NormalizedInvalidUtf8)?;
-        let trie = DoubleArray::from(trie_blob);
-        let precompiled = Precompiled {
+
+        Ok(Precompiled {
             precompiled_charsmap: precompiled_charsmap.to_vec(),
             normalized,
-            trie,
-        };
-        Ok(precompiled)
+            trie: DoubleArray::from(trie_blob),
+        })
     }
 
+    /// Looks up the normalized replacement for `chunk`, returning `None` when no rule matches.
+    #[inline]
     pub fn transform(&self, chunk: &str) -> Option<&str> {
-        let results = self.trie.common_prefix_search(chunk.as_bytes());
-        if results.is_empty() {
-            None
-        } else {
-            let index = results[0] as usize;
-            let mut index2 = index;
-            while index2 < self.normalized.len() {
-                if *self.normalized.as_bytes().get(index2)? == 0u8 {
-                    break;
-                }
-                index2 += 1;
-            }
-            let normalized = &self.normalized[index..index2];
-            Some(normalized)
-        }
+        let index = self.trie.first_prefix_value(chunk.as_bytes())? as usize;
+        let tail = &self.normalized.as_bytes()[index..];
+        let end = memchr(0, tail).unwrap_or(tail.len());
+        Some(&self.normalized[index..index + end])
     }
 
+    /// Applies the embedded normalization rules to `original`.
+    #[inline]
     pub fn normalize_string(&self, original: &str) -> String {
         let mut string = String::with_capacity(original.len());
         // Future reader. From @Narsil.
@@ -201,26 +230,25 @@ impl Precompiled {
         // Mbart, XLMRoberta *AND* Marian. If you don't get 100% or
         // break a single test.
         // You don't pass.
-        original.graphemes(true).for_each(|grapheme| {
-            if grapheme.len() < 6 {
-                if let Some(norm) = self.transform(grapheme) {
-                    for c in norm.chars() {
-                        string.push(c);
-                    }
-                    return;
-                }
+        for grapheme in original.graphemes(true) {
+            let grapheme_len = grapheme.len();
+            if grapheme_len < 6 && let Some(norm) = self.transform(grapheme) {
+                string.push_str(norm);
+                continue;
             }
-            for (char_index, c) in grapheme.char_indices() {
-                let part = &grapheme[char_index..char_index + c.len_utf8()];
+
+            let mut offset = 0;
+            for c in grapheme.chars() {
+                let char_len = c.len_utf8();
+                let part = &grapheme[offset..offset + char_len];
                 if let Some(norm) = self.transform(part) {
-                    for c in norm.chars() {
-                        string.push(c);
-                    }
+                    string.push_str(norm);
                 } else {
                     string.push(c);
                 }
+                offset += char_len;
             }
-        });
+        }
         string
     }
 }
